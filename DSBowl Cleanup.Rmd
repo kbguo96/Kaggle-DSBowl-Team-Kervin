@@ -1,0 +1,791 @@
+---
+title: "DSBowl Final"
+author: "Walter Guo and Kevin Guo"
+date: "1/15/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(jsonlite)
+library(onehot)
+library(xgboost)
+library(data.table)
+library(stats)
+library(ggplot2)
+library(ggfortify)
+library("FactoMineR")
+library("factoextra")
+load("../input/mydsbowl/all de data n xgb.RData")
+mytest <- read.csv("../input/data-science-bowl-2019/test.csv")
+mytrain$event_data <- as.character(mytrain$event_data)
+mytest$event_data <- as.character(mytest$event_data)
+
+gc()
+```
+
+```{r, Helper Functions}
+"""
+Defining helper functions that are called multiple times in the subsequent feature engineering process. 
+"""
+
+#Calculate the Mode of a value
+getmode <- function(v) {
+   uniqv <- unique(v)
+   uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+"""
+Internal Score Calculation Function - Calculates the quadratic weighted kappa evaluation metric used for the competition. 
+Input: Takes a n x n data frame that has a (n - 1) x (n - 1) confusion sub-matrix
+Output: A score between 0 and 1
+"""
+mykappa <- function(df){
+  dfa <- df[,2:dim(df)[2]]
+  r <- dim(dfa)[1]
+  c <- dim(dfa)[2]
+  emat <- matrix(0, r,c)
+  omat <- matrix(0, r,c)
+  wmat <- matrix(0, r,c)
+  
+  rowtots <-  rowSums(dfa)
+  coltots <- colSums(dfa)
+  for(i in 1:r){
+    for(j in 1:c){
+     omat[i,j] <- as.numeric(dfa[i,j])
+     wmat[i,j] <- ((i-j)^2)/(r-1)^2
+     emat[i,j] <- rowtots[i]*coltots[j]
+    }
+  }
+  emat_norm <- sum(wmat*emat/(sum(emat)))
+  omat_norm <- sum(wmat*omat/(sum(omat)))
+  return(1-(omat_norm/emat_norm))
+}
+"""
+Normalization of the time data to better extract duration information and then append that to the data frame.
+"""
+mydates <- function(df){
+  df$year <- as.numeric(substr(df$timestamp, 1,4))
+  df$month <- as.numeric(substr(df$timestamp, 6,7))
+  df$day <- as.numeric(substr(df$timestamp, 9,10))
+  df$hour <- as.numeric(substr(df$timestamp, 12,13))
+  df$minute <- as.numeric(substr(df$timestamp, 15,16))
+  df$sec <- as.numeric(substr(df$timestamp, 18,19))
+  df$milisec <- as.numeric(substr(df$timestamp, 22,23))
+  df$secsum <- sec_compute(df)
+  df <- date_builder(df)
+  return(df)
+}
+"""
+Approximates the time passed since 0 BC. It uses the appended column from the function mydates
+Input: A data frame
+Output: An integer in seconds
+"""
+sec_compute <- function(df_sorted){
+  return((df_sorted$year)*(365*24*60*60) +
+    (df_sorted$month)*(30*24*60*60) + #just approximating each month as 30 days
+    (df_sorted$day)*(24*60*60) +
+    (df_sorted$hour)*(60*60) +
+    (df_sorted$minute)*(60) +
+    (df_sorted$sec))
+}
+"""
+The following functions all count the number of rounds that return false and returns the mode number of falses for a given installation_id, person. Specifically to assist feature engineering extraction that includes true or false data. 
+Input: Data frame
+Output: Integer
+"""
+round_false_mode <- function(df){
+  #this counts the number of times a round shows up false and returns the the most common
+  #parsing even data
+  #extract outside the function
+  tempdataframe <- summarize(group_by(df, installation_id, correct), Correctness_Round_Mode = getmode(round) )
+  return(tempdataframe)
+}
+
+size_false_mode <- function(df){
+  #this counts the number of times a round shows up false and returns the the most common
+  #parsing even data
+  
+  #extract outside the function
+  tempdataframe <- summarize(group_by(df, installation_id, correct), Correctness_Size_Mode = getmode(size) )
+  return(tempdataframe)
+}
+
+bh_false_mode <- function(df){
+  #this counts the number of times a round shows up false and returns the the most common
+  #parsing even data
+  
+  #extract outside the function
+  tempdataframe <- summarize(group_by(df, installation_id, correct), Correctness_BirdHeight_Mode = getmode(bird_height) )
+  return(tempdataframe)
+}
+
+height_false_mode <- function(df){
+  #this counts the number of times a round shows up false and returns the the most common
+  #parsing even data
+  
+  #extract outside the function
+  tempdataframe <- summarize(group_by(df, installation_id, correct), Correctness_Height_Mode = getmode(height) )
+  return(tempdataframe)
+}
+
+"""
+Computes the classification of the installation_id's, person's, performance on a given assessment task
+Input: Dataframe
+Output: Score of type int
+"""
+ag_builder <- function(df){
+#make sure to rename the "temp_acc", and "temp_acc.sums" column to a more discernable column name in the returned dataframe
+df1 <- summarize(group_by(df, installation_id, game_session, correct), myc = n())
+df1.T <- select(filter(df1, correct == T), -correct)
+df1.T <- rename(df1.T, correct.TRUE = myc)
+df1.F <- select(filter(df1, correct == F), -correct)
+df1.F <- rename(df1.F, correct.FALSE = myc)
+df1.C <- full_join(df1.T,df1.F)
+df1 <- df1.C
+df1[is.na(df1)] <- 0
+df1$temp_acc <- 3
+df1$temp_acc[df1$correct.FALSE >0] <-2
+df1$temp_acc[df1$correct.FALSE >1] <-1
+df1$temp_acc[df1$correct.TRUE ==0] <-0
+df2 <- spread(summarise(group_by(df1, installation_id, temp_acc), myc = n()), key = "temp_acc", value = "myc", sep = ".")
+df2[is.na(df2)] <- 0
+df2$temp_acc.sums <- rowSums(df2[,2:5])
+df2[,2:5] <- round(df2[,2:5]/df2$temp_acc.sums, digits = 3)
+
+return(df2)
+}
+```
+
+
+```{r, Inference Module}
+"""
+Infer function assumes that we have perfect information, a full record, and then deduces a score based on that.
+Input:Data frames
+Output: Column with scores (0 - 3)
+"""
+infer <- function(df, ptest){
+  assess_sub <- filter(df, event_code == 4100 | event_code == 4110, type == "Assessment")
+
+# for (i in 1:dim(assess_sub)[1]){
+#   assess_sub$correct[i] <-fromJSON(assess_sub$event_data[i])$correct
+# }
+  tempdf <- stream_in(textConnection(assess_sub$event_data))
+  assess_sub$event_data <- NULL
+  assess_sub$correct <- tempdf$correct
+mgl <- summarize(group_by(assess_sub, game_session, installation_id, title, event_code), attempts = n(), correct = sum(correct)>0)
+mgl <- filter(mgl, (title == "Bird Measurer (Assessment)" & event_code == 4110) | (title != "Bird Measurer (Assessment)" & event_code == 4100))
+mgl$mg <- 1
+mgl$mg[mgl$attempts == 1] <- 3
+mgl$mg[mgl$attempts == 2] <- 2
+mgl$mg[mgl$attempts >= 3] <- 1
+mgl$mg[mgl$correct == F] <- 0
+mgl <- rename(mgl, accuracy_group = mg)
+mgl <- left_join(ptest, select(mgl,-attempts, -correct))
+#mycheck <- right_join(mgl,mylab)
+#mycheck$flag <- mycheck$mg != mycheck$accuracy_group
+
+newdf <- cbind(mgl[,1:2], mgl[,dim(mgl)[2]], mgl[,3:(dim(mgl)[2]-1)])
+return(newdf)
+}
+```
+
+```{r, Feature Engineering Analysis}
+"""
+Wrapper function for running all the feature engineering analysis. Inputdat is the raw training data. mylab are the labels for each assessment attempt scores by installation_id's. Train = T is the default, this means that it is running on training data. Toggle it to false for the test data. 
+Input: Data Frames
+Output: Data Frame with extracted informtion in appended columns 
+"""
+preprocess <- function(inputdat, mylab, train = T){
+##Assessment Matchable people in inputdat
+matchable_train <-as.character(unique(filter(inputdat, type == "Assessment")$installation_id))
+
+##Extracting dates for data and computing different time metrics
+inputdat <- mydates(inputdat)
+inputdat <- filter(inputdat, installation_id %in% matchable_train)
+
+if(train == T){
+session_labels_combined <- select(mylab, installation_id, title, accuracy_group, game_session)
+} else{
+  session_labels_combined <- select(mylab, installation_id, title, game_session)
+}
+mydat <- left_join(session_labels_combined, filter(select(inputdat, installation_id, game_session, event_count, secsum, elapsed_fr, elapsed_gs), event_count == 1)) # attaching the time info
+
+##how many times have person done this assessment in the past
+inputdat$level <- 1
+inputdat$level[grep("Level",as.character(inputdat$title))] <- 0
+assessment_count_table <- summarize(group_by(filter(inputdat, world != "NONE", level ==1), installation_id, game_session, title), myc = n())
+assessment_count_table_wide <- spread(summarize(group_by(assessment_count_table, installation_id, title), myc = n()), key = "title", value = "myc")
+
+
+mydat <- left_join(mydat,assessment_count_table_wide, by = "installation_id")
+rm(assessment_count_table,assessment_count_table_wide)
+gc()
+
+"""
+Building features to extract information specific to activities, games and assessments grouped by installation_id.
+"""
+
+#Analyzing Chowtime data
+chowdat <- filter(inputdat, title == "Chow Time", installation_id %in% matchable_train)
+print("chowtime")
+mytemp <- filter(chowdat, event_code == "2030")
+tempdf <- data.frame()
+tempdf <- stream_in(textConnection(mytemp$event_data))
+mytemp$event_data <- NULL
+
+mytemp <- cbind(mytemp, select(tempdf, round, misses))
+
+tempdtab <- summarize(group_by(mytemp, installation_id), ct_rnds = max(round), ct_tmiss = sum(misses), ct_mode_miss = getmode(misses))
+
+#Checking for rage quits
+mytemp <- filter(chowdat, event_code == "2020" | event_code == "2030")
+tempdf <- stream_in(textConnection(mytemp$event_data))
+mytemp$event_data <- NULL
+
+temp3dtab <- summarize(group_by(mytemp, installation_id), roundStartCount = length(event_code[event_code== "2020"]), roundEndCount = length(event_code[event_code== "2030"]))
+
+tempdtab <- left_join(tempdtab,temp3dtab)
+
+mydat <- left_join(mydat,tempdtab, by = "installation_id")
+rm(chowdat)
+gc()
+
+##Analyzing Happy Camel
+cameldat <- filter(inputdat, title == "Happy Camel", installation_id %in% matchable_train)
+##Assessment Matchable people in inputdat
+print("camel")
+##2020 is round start, initilized items info including bowl count
+mytemp <- filter(cameldat, event_code == "2020")
+tempdf <- stream_in(textConnection(mytemp$event_data))
+tempdf$bowls <- as.character(tempdf$bowls)
+tempdf2 <- separate(tempdf, bowls, into = c("j1", "j2", "j3","toy_pos"), sep = "=")
+tempdf2$toy_pos <- substr(tempdf2$toy_pos,4,nchar(tempdf2$toy_pos)-2)
+tempdf2 <- separate(tempdf2, toy_pos, into = c("p1", "p2", "p3","p4"), sep = ", ")
+tempdf2$toy_pos[as.logical(tempdf2$p1)] <- 1
+tempdf2$toy_pos[as.logical(tempdf2$p2)] <- 2
+tempdf2$toy_pos[as.logical(tempdf2$p3)] <- 3
+tempdf2$toy_pos[as.logical(tempdf2$p4)] <- 4
+toy_pos_matcher <- cbind(mytemp, select(tempdf2, total_bowls, toy_pos, round))
+##2030 is round score summary
+mytemp <- filter(cameldat, event_code == "2030")
+tempdf <- stream_in(textConnection(mytemp$event_data))
+tempdf <- select(tempdf, misses, round)
+mytemp <- cbind(mytemp, tempdf)
+tempdtab <- summarize(group_by(mytemp, installation_id), hap_cam_rnds = max(round), hap_cam_misses = sum(misses), hap_cam_mode_miss = getmode(misses))
+mydat <- left_join(mydat,tempdtab)
+
+mytemp2 <- full_join(mytemp,toy_pos_matcher, by = c("installation_id", "game_session", "round"))
+tempdtab2 <- summarize(group_by(mytemp2, installation_id, total_bowls), hap_cam_skip  = sum(is.na(event_id.x)), 
+                       hap_cam_cor = sum(!is.na(event_id.x)))
+tempdtab2 <- gather(tempdtab2, key = "kind", hap_cam_skip, hap_cam_cor, value = "hc_count")
+tempdtab2 <- unite(tempdtab2, temp, total_bowls, kind)
+tempdtab2 <- spread(tempdtab2, key = "temp", value = "hc_count")
+
+mydat <- left_join(mydat,select(tempdtab2, -starts_with("NA")), by = "installation_id")
+
+##4020 is when a bowl is placed for submission, reveals correct or incorrect
+##4045 is moving a bowl back off from the scale
+##4070 is random clicking, measures level of distraction
+
+rm(cameldat, mytemp2, temptab2, temptab3)
+rm(toy_pos_matcher)
+gc()
+
+#Analyzing Leaf Leader Data
+
+leafleadgame <- filter(inputdat, title == "Leaf Leader", installation_id %in% matchable_train)
+rm(tempdf)
+rm(tempdf2)
+rm(tempdf3)
+print("leaf")
+#---
+mytemp <- filter (leafleadgame, event_code == "4020")
+tempdf <- stream_in(textConnection(mytemp$event_data))
+mytemp$event_data <- NULL
+mytemp <- cbind(mytemp, select(tempdf, correct, dinosaur_count, weight, mode))
+
+tempdtab <- summarize(group_by(mytemp, installation_id), ll_successCount = length(correct[correct== TRUE]), ll_failCount = length(correct[correct== FALSE]), dinoCountMode = getmode(dinosaur_count), weightMode = getmode(weight), removeCount = length(mode[mode== "remove"]), addCount = length(mode[mode== "add"]))
+
+# Distraction Filter
+mytemp2 <- filter(leafleadgame, event_code == "4070")
+tempdf2 <- stream_in(textConnection(mytemp2$event_data))
+mytemp2$event_data <- NULL
+
+mytemp2 <- cbind(mytemp2, select(tempdf2, round))
+
+temp2dtab <- summarize(group_by(mytemp2, installation_id), ll_w1 = n_distinct(round), ll_w2 = n())
+
+tempdtab <- left_join(tempdtab,temp2dtab)
+
+# Time Elapsed in Tutorial | 3010 instruction start | 2070 tutorial end
+mytemp3 <- filter(leafleadgame, event_code == "2000" | event_code == "2070")
+tempdf3 <- stream_in(textConnection(mytemp3$event_data))
+mytemp3$event_data <- NULL
+
+temp3dtab <- summarize(group_by(mytemp3, installation_id), ll_maxtime = max(game_time), ll_watchCount = length(event_code[event_code== "2070"]))
+
+#Checking for rage quits
+mytemp <- filter(leafleadgame, event_code == "2020" | event_code == "2030")
+tempdf <- stream_in(textConnection(mytemp$event_data))
+mytemp$event_data <- NULL
+
+temp3dtab <- summarize(group_by(mytemp, installation_id), ll_roundStartCount = length(event_code[event_code== "2020"]), ll_roundEndCount = length(event_code[event_code== "2030"]))
+
+tempdtab <- left_join(tempdtab,temp3dtab)
+
+mydat <- left_join(mydat,tempdtab)
+rm(leafleadgame)
+gc()
+#Analyzing Scrub a dub game data
+
+#2020 means started roudn
+#4070 means they are being dumb - distracted by something pretty DUMB
+#4020 means u did something right or wrong
+#2030 round completed
+#3021 3121 feedback start and end
+#3010 means instruction start 3110 means instruction end
+
+scrubgame <- filter(inputdat, title == "Scrub-A-Dub", installation_id %in% matchable_train)
+# Success Failure Filter
+print("scrub")
+mytemp <- filter(scrubgame, event_code == "4020")
+tempdf <- stream_in(textConnection(mytemp$event_data))
+mytemp$event_data <- NULL
+
+mytemp <- cbind(mytemp, select(tempdf, correct, size))
+
+tempdtab <- summarize(group_by(mytemp, installation_id), sg_successCount = length(correct[correct== TRUE]), sg_failCount = length(correct[correct== FALSE]), sg_size = getmode(size))
+
+# Distraction Filter
+mytemp2 <- filter(scrubgame, event_code == "4070")
+tempdf2 <- stream_in(textConnection(mytemp2$event_data))
+mytemp2$event_data <- NULL
+
+mytemp2 <- cbind(mytemp2, select(tempdf2, round))
+
+temp2dtab <- summarize(group_by(mytemp2, installation_id), sg_w1 = n_distinct(round), sg_w2 = n())
+
+tempdtab <- left_join(tempdtab,temp2dtab)
+
+# Time Elapsed Between Round Starts
+mytemp3 <- filter(scrubgame, event_code == "2020")
+tempdf3 <- stream_in(textConnection(mytemp3$event_data))
+mytemp3$event_data <- NULL
+mytemp3$level <- NULL
+
+mytemp3 <- cbind(mytemp3, select(tempdf3, game_time))
+
+temp3dtab <- summarize(group_by(mytemp2, installation_id), sg_aveTime = mean(game_time))
+
+tempdtab <- left_join(tempdtab,temp3dtab)
+
+#Checking for rage quits
+mytemp <- filter(scrubgame, event_code == "2020" | event_code == "2030")
+tempdf <- stream_in(textConnection(mytemp$event_data))
+mytemp$event_data <- NULL
+temp3dtab <- summarize(group_by(mytemp, installation_id), sg_roundStartCount = length(event_code[event_code== "2020"]), sg_roundEndCount = length(event_code[event_code== "2030"]))
+
+tempdtab <- left_join(tempdtab,temp3dtab)
+
+mydat <- left_join(mydat,tempdtab)
+rm(scrubgame)
+gc()
+
+#Air Show
+airshow <- filter(inputdat, title == "Air Show", installation_id %in% matchable_train)
+mytemp <- filter(airshow, event_code == "4020")
+tempdf <- stream_in(textConnection(mytemp$event_data))
+mytemp$event_data <- NULL
+print("air")
+mytemp <- cbind(mytemp, select(tempdf, correct, round, target_distances))
+
+mytemp2 <- round_false_mode(mytemp)
+mytemp2 <- rename(mytemp2, as_Correctness_Round_Mode = Correctness_Round_Mode)
+mytemp2$correct <- NULL
+tempdtab <- summarize(group_by(mytemp, installation_id), as_successCount = length(correct[correct== TRUE]), as_failCount = length(correct[correct== FALSE]), as_target_distances = getmode(target_distances), as_roundsPlayed = n_distinct(round))
+
+tempdtab <- left_join(tempdtab, mytemp2)
+
+# Distraction Filter
+mytemp2 <- filter(airshow, event_code == "4070")
+tempdf2 <- stream_in(textConnection(mytemp2$event_data))
+mytemp2$event_data <- NULL
+
+mytemp2 <- cbind(mytemp2, select(tempdf2, round))
+
+temp2dtab <- summarize(group_by(mytemp2, installation_id), as_w1 = n_distinct(round), as_w2 = n())
+
+tempdtab <- left_join(tempdtab,temp2dtab)
+
+
+#Checking for rage quits
+mytemp <- filter(airshow, event_code == "2020" | event_code == "2030")
+tempdf <- stream_in(textConnection(mytemp$event_data))
+mytemp$event_data <- NULL
+temp3dtab <- summarize(group_by(mytemp, installation_id), as_roundStartCount = length(event_code[event_code== "2020"]), as_roundEndCount = length(event_code[event_code== "2030"]))
+
+tempdtab <- left_join(tempdtab,temp3dtab)
+
+mydat <- left_join(mydat,tempdtab, by = "installation_id")
+rm(airshow)
+gc()
+
+#All Star Sorting
+AllStarGame <- filter(inputdat, title == "All Star Sorting", installation_id %in% matchable_train)
+mytemp <- filter(AllStarGame, event_code == "4020")
+tempdf <- stream_in(textConnection(mytemp$event_data))
+mytemp$event_data <- NULL
+print("all star")
+mytemp <- cbind(mytemp, select(tempdf, correct, round, size))
+
+mytemp2 <- size_false_mode(mytemp)
+mytemp2$correct <- NULL
+mytemp2 <- rename(mytemp2, ass_Correctness_Size_Mode = Correctness_Size_Mode)
+
+tempdtab <- summarize(group_by(mytemp, installation_id), ass_successCount = length(correct[correct== TRUE]), ass_failCount = length(correct[correct== FALSE]), ass_sizes = getmode(size), ass_roundsPlayed = n_distinct(round))
+
+tempdtab <- left_join(tempdtab, mytemp2)
+# Distraction Filter
+
+mytemp2 <- filter(AllStarGame, event_code == "4070")
+tempdf2 <- stream_in(textConnection(mytemp2$event_data))
+mytemp2$event_data <- NULL
+
+mytemp2 <- cbind(mytemp2, select(tempdf2, round))
+
+temp2dtab <- summarize(group_by(mytemp2, installation_id), ass_w1 = n_distinct(round), ass_w2 = n())
+
+tempdtab <- left_join(tempdtab,temp2dtab)
+
+#Checking for rage quits
+mytemp <- filter(AllStarGame, event_code == "2020" | event_code == "2030")
+tempdf <- stream_in(textConnection(mytemp$event_data))
+mytemp$event_data <- NULL
+temp3dtab <- summarize(group_by(mytemp, installation_id), ass_roundStartCount = length(event_code[event_code== "2020"]), ass_roundEndCount = length(event_code[event_code== "2030"]))
+
+tempdtab <- left_join(tempdtab,temp3dtab)
+
+mydat <- left_join(mydat,tempdtab)
+rm(AllStarGame)
+gc()
+
+    
+#
+#----- Begin Assestment Feature Engineering -----
+#
+
+#Bird Measurer 4025 is catipillar 4020 is hat
+BMA <- filter(inputdat, title == "Bird Measurer (Assessment)", installation_id %in% matchable_train)
+print("birds")
+mytemp <- filter(BMA, event_code == "4025")
+tempdf <- stream_in(textConnection(mytemp$event_data))
+mytemp$event_data <- NULL
+
+mytemp <- cbind(mytemp, select(tempdf, correct, bird_height, height))
+
+mytemp2 <- bh_false_mode(mytemp)
+mytemp3 <- height_false_mode(mytemp)
+mytemp2 <- left_join(mytemp2, mytemp3)
+
+tempdtab <- summarize(group_by(mytemp, installation_id), bm_successCount = length(correct[correct== TRUE]), bm_failCount = length(correct[correct== FALSE]), bm_height = getmode(height))
+
+tempdtab <- left_join(tempdtab, mytemp2)
+
+mydat <- left_join(mydat,tempdtab, by = "installation_id")
+
+#kervin additional analysis
+mytemp <- filter(BMA, event_code == "4110")
+tempdf <- stream_in(textConnection(mytemp$event_data))
+mytemp$event_data <- NULL
+mytemp <- cbind(mytemp, select(tempdf,correct))
+mytemp3<- ag_builder(mytemp)
+mytemp3 <- rename(mytemp3, birdmeasure.0 = temp_acc.0,
+                  birdmeasure.1 = temp_acc.1,
+                  birdmeasure.2 = temp_acc.2,
+                  birdmeasure.3 = temp_acc.3,
+                  birdmeasure.sums = temp_acc.sums)
+
+mydat <- left_join(mydat,mytemp3,by = "installation_id")
+
+rm(BMA)
+rm(mytemp)
+rm(mytemp2)
+rm(mytemp3)
+gc()
+
+#Cart Balancer  4100 correct gem 2030 counts misses
+CBA <- filter(inputdat, title == "Cart Balancer (Assessment)", installation_id %in% matchable_train)
+print("kart")
+mytemp <- filter(CBA, event_code == "4100")
+tempdf <- stream_in(textConnection(mytemp$event_data))
+mytemp$event_data <- NULL
+# mytemp2 <- tempdf$left
+
+mytemp <- cbind(mytemp, select(tempdf, correct))
+
+tempdtab <- summarize(group_by(mytemp, installation_id), cb_successCount = length(correct[correct== TRUE]), cb_failCount = length(correct[correct== FALSE]))
+
+mydat <- left_join(mydat,tempdtab,by = "installation_id")
+#KG ag analysis
+mytemp3<- ag_builder(mytemp)
+mytemp3 <- rename(mytemp3, cart_bal.0 = temp_acc.0,
+                  cart_bal.1 = temp_acc.1,
+                  cart_bal.2 = temp_acc.2,
+                  cart_bal.3 = temp_acc.3,
+                  cart_bal.sums = temp_acc.sums)
+mydat <- left_join(mydat,mytemp3,by = "installation_id")
+
+# count misses 2030
+mytemp <- filter(CBA, event_code == "2030")
+tempdf <- stream_in(textConnection(mytemp$event_data))
+mytemp$event_data <- NULL
+
+mytemp <- cbind(mytemp, select(tempdf, misses))
+
+tempdtab <- summarize(group_by(mytemp, installation_id), cb_w1 = max(misses))
+
+mydat <- left_join(mydat,tempdtab,by = "installation_id")
+
+rm(CBA)
+rm(mytemp)
+rm(mytemp2)
+rm(mytemp3)
+rm(temp2dtab)
+gc()
+
+#Cauldron Filler 4025 is catipillar 4020 is hat
+CFA <- filter(inputdat, title == "Cauldron Filler (Assessment)", installation_id %in% matchable_train)
+print("cauldron")
+mytemp <- filter(CFA, event_code == "4100")
+tempdf <- stream_in(textConnection(mytemp$event_data))
+mytemp$event_data <- NULL
+
+mytemp <- cbind(mytemp, select(tempdf, correct, duration))
+
+tempdtab <- summarize(group_by(mytemp, installation_id), cf_successCount = length(correct[correct== TRUE]), cf_failCount = length(correct[correct== FALSE]), max(duration))
+mydat <- left_join(mydat,tempdtab,by = "installation_id")
+#KG ag analysis
+mytemp3<- ag_builder(mytemp)
+mytemp3 <- rename(mytemp3, c_filler.0 = temp_acc.0,
+                  c_filler.1 = temp_acc.1,
+                  c_filler.2 = temp_acc.2,
+                  c_filler.3 = temp_acc.3,
+                  c_filler.sums = temp_acc.sums)
+mydat <- left_join(mydat,mytemp3,by = "installation_id")
+
+# count misses 2030
+mytemp <- filter(CFA, event_code == "2030")
+tempdf <- stream_in(textConnection(mytemp$event_data))
+mytemp$event_data <- NULL
+
+mytemp <- cbind(mytemp, select(tempdf, misses))
+
+tempdtab <- summarize(group_by(mytemp, installation_id), cf_w1 = max(misses))
+
+mydat <- left_join(mydat,tempdtab,by = "installation_id")
+rm(CFA)
+gc()
+
+#Chest Sorter 4100 correct gem 2030 counts misses
+CSA <- filter(inputdat, title == "Chest Sorter (Assessment)", installation_id %in% matchable_train)
+print("chest")
+mytemp <- filter(CSA, event_code == "4100")
+tempdf <- stream_in(textConnection(mytemp$event_data))
+mytemp$event_data <- NULL
+# mytemp2 <- tempdf$left
+
+mytemp <- cbind(mytemp, select(tempdf, correct, pillars))
+
+tempdtab <- summarize(group_by(mytemp, installation_id), cs_successCount = length(correct[correct== TRUE]), cs_failCount = length(correct[correct== FALSE]), pillars = getmode(pillars))
+mydat <- left_join(mydat,tempdtab,by = "installation_id")
+#KG ag analysis
+mytemp3<- ag_builder(mytemp)
+mytemp3 <- rename(mytemp3, c_sort.0 = temp_acc.0,
+                  c_sort.1 = temp_acc.1,
+                  c_sort.2 = temp_acc.2,
+                  c_sort.3 = temp_acc.3,
+                  c_sort.sums = temp_acc.sums)
+mydat <- left_join(mydat,mytemp3,by = "installation_id")
+
+# count misses 2030
+mytemp <- filter(CSA, event_code == "2030")
+tempdf <- stream_in(textConnection(mytemp$event_data))
+mytemp$event_data <- NULL
+
+mytemp <- cbind(mytemp, select(tempdf, misses, duration))
+
+tempdtab <- summarize(group_by(mytemp, installation_id), cs_w1 = max(misses), cf_w2 = max(duration))
+
+mydat <- left_join(mydat,tempdtab,by = "installation_id")
+rm(CSA)
+rm(mytemp)
+rm(mytemp2)
+rm(mytemp3)
+rm(tempdtab)
+rm(temp2dtab)
+gc()
+
+#Mushroom Sorter 4100 correct gem 2030 counts misses
+MSA <- filter(inputdat, title == "Mushroom Sorter (Assessment)", installation_id %in% matchable_train)
+print("mushroom")
+mytemp <- filter(MSA, event_code == "4100")
+tempdf <- stream_in(textConnection(mytemp$event_data))
+mytemp$event_data <- NULL
+# mytemp2 <- tempdf$left
+
+mytemp <- cbind(mytemp, select(tempdf, correct, stumps))
+
+tempdtab <- summarize(group_by(mytemp, installation_id), ms_successCount = length(correct[correct== TRUE]), ms_failCount = length(correct[correct== FALSE]), stumps = getmode(stumps))
+mydat <- left_join(mydat,tempdtab,by = "installation_id")
+#KG ag analysis
+mytemp3<- ag_builder(mytemp)
+mytemp3 <- rename(mytemp3, m_sort.0 = temp_acc.0,
+                  m_sort.1 = temp_acc.1,
+                  m_sort.2 = temp_acc.2,
+                  m_sort.3 = temp_acc.3,
+                  m_sort.sums = temp_acc.sums)
+mydat <- left_join(mydat,mytemp3,by = "installation_id")
+
+# count misses 2030
+mytemp <- filter(MSA, event_code == "2030")
+tempdf <- stream_in(textConnection(mytemp$event_data))
+mytemp$event_data <- NULL
+
+mytemp <- cbind(mytemp, select(tempdf, misses, duration))
+
+tempdtab <- summarize(group_by(mytemp, installation_id), ms_w1 = max(misses), ms_w2 = max(duration))
+
+mydat <- left_join(mydat,tempdtab,by = "installation_id")
+rm(MSA)
+rm(mytemp)
+rm(mytemp2)
+rm(mytemp3)
+rm(temp2dtab)
+gc()
+    
+#Cleaning up RAM 
+rm(tempdf)
+rm(tempdf2)
+rm(tempdf3)
+rm(mytemp)
+rm(mytemp2)
+rm(mytemp3)
+rm(tempdtab)
+rm(temp2dtab)
+rm(temp3dtab)
+gc()
+
+#filling in the blanks
+mydat[is.na(mydat)] <- 0
+mydat$myid <- 1:dim(mydat)[1]
+gc()
+
+return(mydat)
+}
+```
+
+```{r, Calling Preprocess}
+"""
+This chunk just sets up the raw data for processing before calling preprocess to run the feature analysis on the data frame. This does it for both the test and training data.
+"""
+#isolating the infor presented for the sessions to predict
+targets <- filter(summarize(group_by(filter(mytest, type == "Assessment"), game_session, installation_id), mmax = max(event_count)), mmax == 1)
+hit_list <- left_join(targets, mytest)
+test_input <- anti_join(mytest, targets)
+test_slab_input <- summarize(group_by(filter(mytest, type == "Assessment"), game_session, installation_id, title), myc = n())
+
+#identifying the output observations for the test data
+tdf <- mydates(mytest)
+bullseye <- summarize(group_by(filter(tdf, type == "Assessment"), installation_id),
+                            secsum = max(secsum))
+temp <- left_join(bullseye, tdf)
+assess_atmpt_list <- unique(select(temp, installation_id, title, game_session))
+hitlist2 <- select(left_join(assess_atmpt_list, mytest), installation_id, game_session)
+test_input2 <- anti_join(mytest, assess_atmpt_list)
+rm(temp)
+gc()
+
+processed_test <- preprocess(mytest, test_slab_input, train = F)
+
+labled_test <- infer(test_input2, processed_test)
+labled_test$event_code <- NULL
+#sum(colnames(select(labled_test, - accuracy_group)) != colnames(processed_test))
+rm(mytest)
+dbw <- left_join(select(ungroup(assess_atmpt_list), installation_id, game_session),processed_test)
+gc()
+```
+
+
+```{r, Model Fitting}
+"""
+Prepping the data for xgboost 
+"""
+#xgboosting
+## stage 1 generating softmax probs
+full_dat <- filter(labled_test, is.na(accuracy_group)==F)
+full_dat$title <- as.factor(as.character(full_dat$title))
+full_dat$myid <- 1:dim(full_dat)[1]
+
+xgboost_formatted_data <- full_dat
+xgboost_formatted_data <- select(xgboost_formatted_data, -installation_id, -game_session)
+final_formatted_data <- predict(onehot(xgboost_formatted_data), xgboost_formatted_data)
+formatted_training_data <- final_formatted_data 
+
+tempdat <- select(ungroup(dbw), -installation_id, -game_session)
+tempdat$title <- as.character(tempdat$title)
+tempdat$title <- as.factor(tempdat$title)
+prediction_set <- predict(onehot(tempdat), tempdat)
+formatted_test_data <- prediction_set 
+
+mxg <- mxg_train
+
+#stage 1 training kappa performance
+
+mypredict_train <- predict(mxg, formatted_training_data[,c(1:5, 7:dim(formatted_training_data)[2])])
+
+mypredict_train <- as.data.frame(t(matrix(as.numeric(mypredict_train), 4, dim(xgboost_formatted_data)[1])))
+
+mypredict_train$actual <- formatted_training_data[,6]
+
+for (i in 1:dim(mypredict_train)[1]){
+  mypredict_train$default[i] <- which.max(mypredict_train[i,1:4])-1
+}
+train_kappa <- spread(summarize(group_by(select(mypredict_train, actual, default),
+                                         actual, default), myc = n()), key = "default", value = "myc")
+train_kappa[is.na(train_kappa)] <-0
+print("train_kappa")
+print(mykappa(train_kappa))
+
+#stage 1 test kappa performance
+mypredict_test <- predict(mxg, formatted_test_data)
+mypredict_test <- as.data.frame(t(matrix(as.numeric(mypredict_test), 4, dim(formatted_test_data)[1])))
+for (i in 1:dim(mypredict_test)[1]){
+  mypredict_test$default[i] <- which.max(mypredict_test[i,1:4])-1
+}
+#some re-done classification rules
+mypredict_test$revised <- mypredict_test$default
+
+results <- dbw
+results$accuracy_group <- mypredict_test$revised
+results <- select(ungroup(results), installation_id, accuracy_group)
+results$installation_id <- as.character(results$installation_id)
+results$accuracy_group <- as.integer(results$accuracy_group)
+samp_sub2 <- samp_sub
+
+#memory management
+rm(xgboost_formatted_data,final_formatted_data,formatted_test_data,formatted_training_data)
+gc()
+```
+
+
+```{r, Output file path}
+write.csv(read.csv("../input/data-science-bowl-2019/sample_submission.csv"), "sample.csv")
+post_estimation_diagnostics <- full_join(results, samp_sub, by = "installation_id")
+
+```
+
+```{r, Post Esitmation Diagnostics}
+head(post_estimation_diagnostics)
+dim(post_estimation_diagnostics)
+```
+
